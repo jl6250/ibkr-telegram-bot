@@ -21,11 +21,9 @@ HEADERS = {
     "User-Agent": "Python/3.11 (IBKR-Telegram-Notifier/1.0)"
 }
 
-# IBKR 最新官方及容灾网关端点列表 (官方已弃用旧版 gdcdyn)
-IBKR_BASE_URLS = [
-    "https://ndcdyn.interactivebrokers.com/Universal/servlet",
-    "https://www.interactivebrokers.com/Universal/servlet"
-]
+# IBKR 官方最新标准路径 (已从旧版 Universal/servlet 迁移至 AccountManagement/FlexWebService)
+PRIMARY_BASE_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService"
+FALLBACK_BASE_URL = "https://ndcdyn.interactivebrokers.com/Universal/servlet"
 
 
 def validate_environment():
@@ -43,28 +41,48 @@ def validate_environment():
 
 
 def fetch_ibkr_statement(token: str, query_id: str) -> str:
-    """Fetch Flex XML report from IBKR using the 2-step Flex Web Service with fallback domains."""
+    """Fetch Flex XML report from IBKR using the 2-step Flex Web Service."""
+    endpoints_to_try = [
+        f"{PRIMARY_BASE_URL}/SendRequest",
+        f"{FALLBACK_BASE_URL}/FlexStatementService.SendRequest"
+    ]
+    
     resp = None
-    working_base = None
+    used_endpoint = None
     last_err = None
 
-    for base_url in IBKR_BASE_URLS:
-        send_url = f"{base_url}/FlexStatementService.SendRequest?t={token}&q={query_id}&v=3"
-        print(f"▶ 正在向 IBKR 发起报表生成请求 [{base_url}]...")
-        try:
-            r = requests.get(send_url, headers=HEADERS, timeout=30)
-            if r.status_code == 200:
-                resp = r
-                working_base = base_url
-                break
-            else:
-                last_err = f"HTTP {r.status_code}: {r.text}"
-        except Exception as e:
-            print(f"  节点 {base_url} 连接失败: {e}，尝试备用节点...")
-            last_err = str(e)
+    for ep in endpoints_to_try:
+        send_url = f"{ep}?t={token}&q={query_id}&v=3"
+        print(f"▶ 正在向 IBKR 发起报表生成请求 [{ep}]...")
+        for attempt in range(1, 4):
+            try:
+                r = requests.get(send_url, headers=HEADERS, timeout=30)
+                if r.status_code == 200:
+                    # 遇到 1018 限频自动等待 15 秒
+                    if "1018" in r.text or "Too many requests" in r.text:
+                        print("  ⏳ 触发请求频率限制 (Error 1018)，等待 15 秒后重试...")
+                        time.sleep(15)
+                        continue
+                    # 遇到 1001 排队自动等待 10 秒
+                    if "1001" in r.text:
+                        print("  ⏳ 报表引擎排队中 (Error 1001)，等待 10 秒后重试...")
+                        time.sleep(10)
+                        continue
+                    resp = r
+                    used_endpoint = ep
+                    break
+                else:
+                    last_err = f"HTTP {r.status_code}: {r.text}"
+            except Exception as e:
+                print(f"  连接失败: {e}...")
+                last_err = str(e)
+                time.sleep(3)
 
-    if not resp or not working_base:
-        raise RuntimeError(f"所有 IBKR 接口节点均连接失败: {last_err}")
+        if resp:
+            break
+
+    if not resp:
+        raise RuntimeError(f"IBKR 接口连接失败: {last_err}")
 
     try:
         root = ET.fromstring(resp.text)
@@ -80,7 +98,13 @@ def fetch_ibkr_statement(token: str, query_id: str) -> str:
     ref_code = root.findtext(".//ReferenceCode")
     print(f"✔ 成功获取 ReferenceCode: {ref_code}，等待报表生成...")
 
-    fetch_url = f"{working_base}/FlexStatementService.GetStatement?q={ref_code}&t={token}&v=3"
+    # 根据调用的路径自动匹配 GetStatement 基础 URL
+    if "AccountManagement" in used_endpoint:
+        fetch_base = f"{PRIMARY_BASE_URL}/GetStatement"
+    else:
+        fetch_base = f"{FALLBACK_BASE_URL}/FlexStatementService.GetStatement"
+
+    fetch_url = f"{fetch_base}?q={ref_code}&t={token}&v=3"
     max_retries = 15
     for attempt in range(1, max_retries + 1):
         time.sleep(5)
@@ -92,7 +116,7 @@ def fetch_ibkr_statement(token: str, query_id: str) -> str:
                 if "<FlexQueryResponse" in content or "<FlexStatements" in content:
                     print("✔ 报表获取成功！")
                     return content
-                if "Statement is not ready" in content:
+                if "Statement is not ready" in content or "1019" in content:
                     continue
                 if "<Status>Fail</Status>" in content:
                     err_xml = ET.fromstring(content)
@@ -149,18 +173,18 @@ def parse_statement(xml_content: str) -> dict:
     if cash_node is not None:
         cash = float(cash_node.get("endingCash", 0.0) or cash_node.get("endingSettledCash", 0.0))
 
-    # 3. 资产净值提取（兼容多种官方 XML 标签名）
+    # 3. 资产净值提取
     nav = 0.0
     stock_val = 0.0
     daily_pnl = 0.0
 
-    # 尝试读取 ChangeInNAV 里的当日变动
+    # 尝试读取 ChangeInNAV
     change_nav = root.find(".//ChangeInNAV")
     if change_nav is not None:
         nav = float(change_nav.get("endingNav", 0.0))
         daily_pnl = float(change_nav.get("changeInNAV", 0.0))
 
-    # 尝试从 EquitySummary 各类标签提取
+    # 尝试从各类 EquitySummary 标签提取
     nav_tags = [
         ".//EquitySummaryByReportDateInBase",
         ".//EquitySummaryInBase",
@@ -178,7 +202,7 @@ def parse_statement(xml_content: str) -> dict:
             if s_val > 0 and stock_val == 0.0:
                 stock_val = s_val
 
-    # 4. 兜底计算（基于持仓与现金求和，确保永不出现 $0.00）
+    # 4. 智能兜底计算（基于持仓与现金求和）
     if stock_val == 0.0:
         stock_val = stock_val_calc
 
@@ -217,7 +241,7 @@ def format_telegram_message(data: dict) -> str:
         f"💵 <b>可用现金余额:</b> {cur} ${data['cash']:,.2f}",
     ]
 
-    # 当日盈亏
+    # 当日盈亏（如有变动）
     if daily_pnl != 0.0:
         pnl_icon = "🟢" if daily_pnl >= 0 else "🔴"
         pnl_sign = "+" if daily_pnl >= 0 else ""
