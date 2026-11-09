@@ -21,6 +21,12 @@ HEADERS = {
     "User-Agent": "Python/3.11 (IBKR-Telegram-Notifier/1.0)"
 }
 
+# IBKR 最新官方及容灾网关端点列表 (官方已弃用旧版 gdcdyn)
+IBKR_BASE_URLS = [
+    "https://ndcdyn.interactivebrokers.com/Universal/servlet",
+    "https://www.interactivebrokers.com/Universal/servlet"
+]
+
 
 def validate_environment():
     missing = []
@@ -37,16 +43,28 @@ def validate_environment():
 
 
 def fetch_ibkr_statement(token: str, query_id: str) -> str:
-    """Fetch Flex XML report from IBKR using the 2-step Flex Web Service."""
-    
-    send_url = (
-        f"https://ndcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.SendRequest"
-        f"?t={token}&q={query_id}&v=3"
-    )
-    print("▶ 正在向 IBKR 发起报表生成请求...")
-    resp = requests.get(send_url, headers=HEADERS, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"SendRequest HTTP 错误: {resp.status_code} - {resp.text}")
+    """Fetch Flex XML report from IBKR using the 2-step Flex Web Service with fallback domains."""
+    resp = None
+    working_base = None
+    last_err = None
+
+    for base_url in IBKR_BASE_URLS:
+        send_url = f"{base_url}/FlexStatementService.SendRequest?t={token}&q={query_id}&v=3"
+        print(f"▶ 正在向 IBKR 发起报表生成请求 [{base_url}]...")
+        try:
+            r = requests.get(send_url, headers=HEADERS, timeout=30)
+            if r.status_code == 200:
+                resp = r
+                working_base = base_url
+                break
+            else:
+                last_err = f"HTTP {r.status_code}: {r.text}"
+        except Exception as e:
+            print(f"  节点 {base_url} 连接失败: {e}，尝试备用节点...")
+            last_err = str(e)
+
+    if not resp or not working_base:
+        raise RuntimeError(f"所有 IBKR 接口节点均连接失败: {last_err}")
 
     try:
         root = ET.fromstring(resp.text)
@@ -60,31 +78,31 @@ def fetch_ibkr_statement(token: str, query_id: str) -> str:
         raise RuntimeError(f"IBKR 接口报错 [{err_code}]: {err_msg}")
 
     ref_code = root.findtext(".//ReferenceCode")
-    fetch_base_url = (
-        root.findtext(".//Url")
-        or "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement"
-    )
     print(f"✔ 成功获取 ReferenceCode: {ref_code}，等待报表生成...")
 
-    fetch_url = f"{fetch_base_url}?q={ref_code}&t={token}&v=3"
-    max_retries = 12
+    fetch_url = f"{working_base}/FlexStatementService.GetStatement?q={ref_code}&t={token}&v=3"
+    max_retries = 15
     for attempt in range(1, max_retries + 1):
         time.sleep(5)
         print(f"  [重试 {attempt}/{max_retries}] 正在获取报表数据...")
-        fetch_resp = requests.get(fetch_url, headers=HEADERS, timeout=60)
-        if fetch_resp.status_code == 200:
-            content = fetch_resp.text
-            if "<FlexQueryResponse" in content or "<FlexStatements" in content:
-                print("✔ 报表获取成功！")
-                return content
-            if "Statement is not ready" in content:
-                continue
-            if "<Status>Fail</Status>" in content:
-                err_xml = ET.fromstring(content)
-                raise RuntimeError(f"获取报表失败: {err_xml.findtext('.//ErrorMessage')}")
+        try:
+            fetch_resp = requests.get(fetch_url, headers=HEADERS, timeout=60)
+            if fetch_resp.status_code == 200:
+                content = fetch_resp.text
+                if "<FlexQueryResponse" in content or "<FlexStatements" in content:
+                    print("✔ 报表获取成功！")
+                    return content
+                if "Statement is not ready" in content:
+                    continue
+                if "<Status>Fail</Status>" in content:
+                    err_xml = ET.fromstring(content)
+                    raise RuntimeError(f"获取报表失败: {err_xml.findtext('.//ErrorMessage')}")
+        except requests.RequestException as req_err:
+            print(f"  网络请求波动: {req_err}，继续重试...")
+
         print("  ⏳ 报表尚未就绪，稍后重试...")
 
-    raise TimeoutError("IBKR 报表生成超时，超过最大轮询等待时间 (60秒)。")
+    raise TimeoutError("IBKR 报表生成超时，超过最大轮询等待时间。")
 
 
 def parse_statement(xml_content: str) -> dict:
@@ -102,37 +120,7 @@ def parse_statement(xml_content: str) -> dict:
         if not account_id:
             account_id = account_info.get("accountId", "")
 
-    nav = 0.0
-    prior_nav = 0.0
-    cash = 0.0
-    stock_val = 0.0
-    daily_pnl = 0.0
-
-    # 1. 尝试从 ChangeInNAV 获取总览
-    change_nav = root.find(".//ChangeInNAV")
-    if change_nav is not None:
-        nav = float(change_nav.get("endingNav", 0.0))
-        prior_nav = float(change_nav.get("priorNav", 0.0))
-        daily_pnl = float(change_nav.get("changeInNAV", 0.0))
-
-    # 2. 从 EquitySummaryInBase 提取资产分布
-    equity_nodes = root.findall(".//EquitySummaryInBase")
-    for eq in equity_nodes:
-        tot = float(eq.get("total", 0.0))
-        c_val = float(eq.get("cash", 0.0))
-        s_val = float(eq.get("stock", 0.0))
-        if tot > 0:
-            nav = tot
-            cash = c_val
-            stock_val = s_val
-
-    # 3. 现金补充解析
-    if cash == 0.0:
-        cash_node = root.find(".//CashReportCurrency[@currency='BASE_SUMMARY']") or root.find(".//CashReportCurrency")
-        if cash_node is not None:
-            cash = float(cash_node.get("endingCash", 0.0) or cash_node.get("endingSettledCash", 0.0))
-
-    # 4. 未平仓持仓明细 (OpenPositions)
+    # 1. 未平仓持仓明细 (OpenPositions)
     positions = []
     for pos in root.findall(".//OpenPosition"):
         symbol = pos.get("symbol", "N/A")
@@ -140,19 +128,62 @@ def parse_statement(xml_content: str) -> dict:
         mark_price = float(pos.get("markPrice", 0.0))
         val = float(pos.get("positionValue", 0.0))
         unrealized_pnl = float(pos.get("fifoPnlUnrealized", 0.0))
-        percent_nav = float(pos.get("percentOfNAV", 0.0))
 
         positions.append({
             "symbol": symbol,
             "quantity": qty,
             "mark_price": mark_price,
             "value": val,
-            "unrealized_pnl": unrealized_pnl,
-            "percent_nav": percent_nav
+            "unrealized_pnl": unrealized_pnl
         })
 
-    if daily_pnl == 0.0 and prior_nav > 0 and nav > 0:
-        daily_pnl = nav - prior_nav
+    stock_val_calc = sum(p["value"] for p in positions)
+    total_unrealized_pnl = sum(p["unrealized_pnl"] for p in positions)
+
+    # 2. 现金提取
+    cash = 0.0
+    cash_node = (
+        root.find(".//CashReportCurrency[@currency='BASE_SUMMARY']")
+        or root.find(".//CashReportCurrency")
+    )
+    if cash_node is not None:
+        cash = float(cash_node.get("endingCash", 0.0) or cash_node.get("endingSettledCash", 0.0))
+
+    # 3. 资产净值提取（兼容多种官方 XML 标签名）
+    nav = 0.0
+    stock_val = 0.0
+    daily_pnl = 0.0
+
+    # 尝试读取 ChangeInNAV 里的当日变动
+    change_nav = root.find(".//ChangeInNAV")
+    if change_nav is not None:
+        nav = float(change_nav.get("endingNav", 0.0))
+        daily_pnl = float(change_nav.get("changeInNAV", 0.0))
+
+    # 尝试从 EquitySummary 各类标签提取
+    nav_tags = [
+        ".//EquitySummaryByReportDateInBase",
+        ".//EquitySummaryInBase",
+        ".//NetAssetValueInBase"
+    ]
+    for tag in nav_tags:
+        for node in root.findall(tag):
+            tot = float(node.get("total", 0.0))
+            c_val = float(node.get("cash", 0.0))
+            s_val = float(node.get("stock", 0.0))
+            if tot > 0 and nav == 0.0:
+                nav = tot
+            if c_val > 0 and cash == 0.0:
+                cash = c_val
+            if s_val > 0 and stock_val == 0.0:
+                stock_val = s_val
+
+    # 4. 兜底计算（基于持仓与现金求和，确保永不出现 $0.00）
+    if stock_val == 0.0:
+        stock_val = stock_val_calc
+
+    if nav == 0.0:
+        nav = stock_val + cash
 
     return {
         "account_id": account_id,
@@ -162,6 +193,7 @@ def parse_statement(xml_content: str) -> dict:
         "cash": cash,
         "stock_val": stock_val,
         "daily_pnl": daily_pnl,
+        "total_unrealized_pnl": total_unrealized_pnl,
         "positions": positions
     }
 
@@ -172,24 +204,33 @@ def format_telegram_message(data: dict) -> str:
     acc = html.escape(data["account_id"] or "主账户")
     dt = html.escape(data["date"] or time.strftime("%Y-%m-%d"))
 
+    nav = data["nav"]
     daily_pnl = data["daily_pnl"]
-    pnl_sign = "+" if daily_pnl >= 0 else ""
-    pnl_icon = "🟢" if daily_pnl >= 0 else "🔴"
-
-    base_for_pct = data["nav"] - daily_pnl
-    pct_val = (daily_pnl / base_for_pct * 100) if base_for_pct > 0 else 0.0
+    total_unrealized = data["total_unrealized_pnl"]
 
     lines = [
         "📊 <b>IBKR 每日投资资产报告</b>",
         f"👤 账户: <code>{acc}</code> | 结算日: <code>{dt}</code>",
         "────────────────",
-        f"💰 <b>账户总资产 (NAV):</b> {cur} ${data['nav']:,.2f}",
-        f"📈 <b>当日盈亏变动:</b> {pnl_icon} {cur} ${daily_pnl:+,.2f} ({pnl_sign}{pct_val:,.2f}%)",
-        f"💵 <b>可用现金余额:</b> {cur} ${data['cash']:,.2f}",
+        f"💰 <b>账户总资产 (NAV):</b> {cur} ${nav:,.2f}",
         f"🏢 <b>持仓证券总值:</b> {cur} ${data['stock_val']:,.2f}",
-        "────────────────",
-        "<b>📦 核心持仓明细:</b>"
+        f"💵 <b>可用现金余额:</b> {cur} ${data['cash']:,.2f}",
     ]
+
+    # 当日盈亏
+    if daily_pnl != 0.0:
+        pnl_icon = "🟢" if daily_pnl >= 0 else "🔴"
+        pnl_sign = "+" if daily_pnl >= 0 else ""
+        base_nav = nav - daily_pnl
+        pct = (daily_pnl / base_nav * 100) if base_nav > 0 else 0.0
+        lines.append(f"📈 <b>当日盈亏变动:</b> {pnl_icon} {cur} ${daily_pnl:+,.2f} ({pnl_sign}{pct:,.2f}%)")
+
+    # 累计未实现浮盈
+    unreal_icon = "🟢" if total_unrealized >= 0 else "🔴"
+    lines.append(f"📊 <b>持仓累计浮盈:</b> {unreal_icon} {cur} ${total_unrealized:+,.2f}")
+
+    lines.append("────────────────")
+    lines.append("<b>📦 核心持仓明细:</b>")
 
     positions = data["positions"]
     if positions:
@@ -197,9 +238,9 @@ def format_telegram_message(data: dict) -> str:
         for pos in positions:
             sym = html.escape(pos["symbol"])
             pos_icon = "🟢" if pos["unrealized_pnl"] >= 0 else "🔴"
-            pct_str = f" ({pos['percent_nav']:.1f}%)" if pos['percent_nav'] > 0 else ""
+            weight = (pos["value"] / nav * 100) if nav > 0 else 0.0
             lines.append(
-                f"• <b>{sym}</b>: {pos['quantity']:,.1f} 股 | 市值 ${pos['value']:,.2f}{pct_str}\n"
+                f"• <b>{sym}</b>: {pos['quantity']:,.1f} 股 | 市值 ${pos['value']:,.2f} ({weight:.1f}%)\n"
                 f"   └ 现价 ${pos['mark_price']:,.2f} | 浮盈 {pos_icon} ${pos['unrealized_pnl']:+,.2f}"
             )
     else:
