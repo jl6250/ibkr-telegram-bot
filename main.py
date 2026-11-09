@@ -38,8 +38,9 @@ def validate_environment():
 
 def fetch_ibkr_statement(token: str, query_id: str) -> str:
     """Fetch Flex XML report from IBKR using the 2-step Flex Web Service."""
+    
     send_url = (
-        f"https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.SendRequest"
+        f"https://ndcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.SendRequest"
         f"?t={token}&q={query_id}&v=3"
     )
     print("▶ 正在向 IBKR 发起报表生成请求...")
