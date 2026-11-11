@@ -1,10 +1,6 @@
 name: IBKR Daily Telegram Report
 
 on:
-  schedule:
-    # 国际标准时间 UTC 06:05 (对应北京时间次日早上 14:05，美股与欧股均已收盘清算)
-    # 周一至周六 UTC 对应周二至周六晨间推送交易日报告
-    #- cron: '5 6 * * 1-6'
   workflow_dispatch: # 支持在 GitHub 页面随时手动一键触发测试
 
 jobs:
