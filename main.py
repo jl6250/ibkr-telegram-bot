@@ -21,9 +21,15 @@ HEADERS = {
     "User-Agent": "Python/3.11 (IBKR-Telegram-Notifier/1.0)"
 }
 
-# IBKR 官方最新标准路径 (已从旧版 Universal/servlet 迁移至 AccountManagement/FlexWebService)
 PRIMARY_BASE_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService"
 FALLBACK_BASE_URL = "https://ndcdyn.interactivebrokers.com/Universal/servlet"
+
+
+def safe_float(val, default=0.0) -> float:
+    try:
+        return float(val) if val not in (None, "") else default
+    except (ValueError, TypeError):
+        return default
 
 
 def validate_environment():
@@ -46,7 +52,7 @@ def fetch_ibkr_statement(token: str, query_id: str) -> str:
         f"{PRIMARY_BASE_URL}/SendRequest",
         f"{FALLBACK_BASE_URL}/FlexStatementService.SendRequest"
     ]
-    
+
     resp = None
     used_endpoint = None
     last_err = None
@@ -58,12 +64,10 @@ def fetch_ibkr_statement(token: str, query_id: str) -> str:
             try:
                 r = requests.get(send_url, headers=HEADERS, timeout=30)
                 if r.status_code == 200:
-                    # 遇到 1018 限频自动等待 15 秒
                     if "1018" in r.text or "Too many requests" in r.text:
                         print("  ⏳ 触发请求频率限制 (Error 1018)，等待 15 秒后重试...")
                         time.sleep(15)
                         continue
-                    # 遇到 1001 排队自动等待 10 秒
                     if "1001" in r.text:
                         print("  ⏳ 报表引擎排队中 (Error 1001)，等待 10 秒后重试...")
                         time.sleep(10)
@@ -98,7 +102,6 @@ def fetch_ibkr_statement(token: str, query_id: str) -> str:
     ref_code = root.findtext(".//ReferenceCode")
     print(f"✔ 成功获取 ReferenceCode: {ref_code}，等待报表生成...")
 
-    # 根据调用的路径自动匹配 GetStatement 基础 URL
     if "AccountManagement" in used_endpoint:
         fetch_base = f"{PRIMARY_BASE_URL}/GetStatement"
     else:
@@ -148,66 +151,96 @@ def parse_statement(xml_content: str) -> dict:
     positions = []
     for pos in root.findall(".//OpenPosition"):
         symbol = pos.get("symbol", "N/A")
-        qty = float(pos.get("position", 0.0))
-        mark_price = float(pos.get("markPrice", 0.0))
-        val = float(pos.get("positionValue", 0.0))
-        unrealized_pnl = float(pos.get("fifoPnlUnrealized", 0.0))
+        qty = safe_float(pos.get("position"))
+        mark_price = safe_float(pos.get("markPrice"))
+        val = safe_float(pos.get("positionValue"))
+        unrealized_pnl = safe_float(pos.get("fifoPnlUnrealized"))
+        asset_cat = pos.get("assetCategory", "")
 
         positions.append({
             "symbol": symbol,
+            "asset_category": asset_cat,
             "quantity": qty,
             "mark_price": mark_price,
             "value": val,
             "unrealized_pnl": unrealized_pnl
         })
 
-    stock_val_calc = sum(p["value"] for p in positions)
+    securities_val_calc = sum(p["value"] for p in positions)
     total_unrealized_pnl = sum(p["unrealized_pnl"] for p in positions)
 
-    # 2. 现金提取
-    cash = 0.0
-    cash_node = (
-        root.find(".//CashReportCurrency[@currency='BASE_SUMMARY']")
-        or root.find(".//CashReportCurrency")
-    )
-    if cash_node is not None:
-        cash = float(cash_node.get("endingCash", 0.0) or cash_node.get("endingSettledCash", 0.0))
-
-    # 3. 资产净值提取
+    # 2. 提取最新一天的 EquitySummary（按 reportDate 排序取最后一条最新日期）
     nav = 0.0
-    stock_val = 0.0
-    daily_pnl = 0.0
+    cash = 0.0
+    securities_val = 0.0
+    accruals = 0.0
+    prior_day_nav = 0.0
 
-    # 尝试读取 ChangeInNAV
+    equity_nodes = (
+        root.findall(".//EquitySummaryByReportDateInBase")
+        or root.findall(".//EquitySummaryInBase")
+        or root.findall(".//NetAssetValueInBase")
+    )
+    if equity_nodes:
+        # 过滤出带有有效 total 的节点，并按 reportDate 升序排列
+        valid_eq = [n for n in equity_nodes if safe_float(n.get("total")) > 0]
+        if valid_eq:
+            valid_eq.sort(key=lambda n: n.get("reportDate", ""))
+            latest_eq = valid_eq[-1]
+            if len(valid_eq) >= 2:
+                prior_day_nav = safe_float(valid_eq[-2].get("total"))
+
+            nav = safe_float(latest_eq.get("total"))
+            cash = safe_float(latest_eq.get("cash"))
+            stock = safe_float(latest_eq.get("stock"))
+            bonds = safe_float(latest_eq.get("bonds"))
+            options = safe_float(latest_eq.get("options"))
+            funds = safe_float(latest_eq.get("funds"))
+            securities_val = stock + bonds + options + funds
+            accruals = (
+                safe_float(latest_eq.get("interestAccruals"))
+                + safe_float(latest_eq.get("dividendAccruals"))
+            )
+            if latest_eq.get("reportDate"):
+                report_date = latest_eq.get("reportDate")
+
+    # 3. 现金补充解析（若 EquitySummary 中未包含现金）
+    if cash == 0.0:
+        cash_node = (
+            root.find(".//CashReportCurrency[@currency='BASE_SUMMARY']")
+            or root.find(".//CashReportCurrency")
+        )
+        if cash_node is not None:
+            cash = safe_float(cash_node.get("endingCash")) or safe_float(cash_node.get("endingSettledCash"))
+
+    # 4. 读取 ChangeInNAV（兼容 IBKR 官方属性名 startingValue / endingValue / mtm）
+    daily_pnl = 0.0
     change_nav = root.find(".//ChangeInNAV")
     if change_nav is not None:
-        nav = float(change_nav.get("endingNav", 0.0))
-        daily_pnl = float(change_nav.get("changeInNAV", 0.0))
+        end_v = safe_float(change_nav.get("endingValue")) or safe_float(change_nav.get("endingNav"))
+        start_v = safe_float(change_nav.get("startingValue")) or safe_float(change_nav.get("priorNav"))
+        mtm_v = safe_float(change_nav.get("mtm"))
+        chg_v = safe_float(change_nav.get("changeInNAV"))
 
-    # 尝试从各类 EquitySummary 标签提取
-    nav_tags = [
-        ".//EquitySummaryByReportDateInBase",
-        ".//EquitySummaryInBase",
-        ".//NetAssetValueInBase"
-    ]
-    for tag in nav_tags:
-        for node in root.findall(tag):
-            tot = float(node.get("total", 0.0))
-            c_val = float(node.get("cash", 0.0))
-            s_val = float(node.get("stock", 0.0))
-            if tot > 0 and nav == 0.0:
-                nav = tot
-            if c_val > 0 and cash == 0.0:
-                cash = c_val
-            if s_val > 0 and stock_val == 0.0:
-                stock_val = s_val
+        if nav == 0.0 and end_v > 0:
+            nav = end_v
+        if mtm_v != 0.0:
+            daily_pnl = mtm_v
+        elif chg_v != 0.0:
+            daily_pnl = chg_v
+        elif end_v > 0 and start_v > 0:
+            daily_pnl = end_v - start_v
 
-    # 4. 智能兜底计算（基于持仓与现金求和）
-    if stock_val == 0.0:
-        stock_val = stock_val_calc
+    # 若 ChangeInNAV 未提供变动，则用相邻两天的总资产差值兜底
+    if daily_pnl == 0.0 and nav > 0 and prior_day_nav > 0:
+        daily_pnl = nav - prior_day_nav
+
+    # 5. 兜底核算持仓总值与净资产
+    if securities_val == 0.0:
+        securities_val = securities_val_calc
 
     if nav == 0.0:
-        nav = stock_val + cash
+        nav = securities_val + cash + accruals
 
     return {
         "account_id": account_id,
@@ -215,7 +248,8 @@ def parse_statement(xml_content: str) -> dict:
         "currency": base_currency,
         "nav": nav,
         "cash": cash,
-        "stock_val": stock_val,
+        "securities_val": securities_val,
+        "accruals": accruals,
         "daily_pnl": daily_pnl,
         "total_unrealized_pnl": total_unrealized_pnl,
         "positions": positions
@@ -237,11 +271,13 @@ def format_telegram_message(data: dict) -> str:
         f"👤 账户: <code>{acc}</code> | 结算日: <code>{dt}</code>",
         "────────────────",
         f"💰 <b>账户总资产 (NAV):</b> {cur} ${nav:,.2f}",
-        f"🏢 <b>持仓证券总值:</b> {cur} ${data['stock_val']:,.2f}",
+        f"🏢 <b>持仓证券总值:</b> {cur} ${data['securities_val']:,.2f}",
         f"💵 <b>可用现金余额:</b> {cur} ${data['cash']:,.2f}",
     ]
 
-    # 当日盈亏（如有变动）
+    if data["accruals"] != 0.0:
+        lines.append(f"🧾 <b>应计利息/股息:</b> {cur} ${data['accruals']:,.2f}")
+
     if daily_pnl != 0.0:
         pnl_icon = "🟢" if daily_pnl >= 0 else "🔴"
         pnl_sign = "+" if daily_pnl >= 0 else ""
@@ -249,7 +285,6 @@ def format_telegram_message(data: dict) -> str:
         pct = (daily_pnl / base_nav * 100) if base_nav > 0 else 0.0
         lines.append(f"📈 <b>当日盈亏变动:</b> {pnl_icon} {cur} ${daily_pnl:+,.2f} ({pnl_sign}{pct:,.2f}%)")
 
-    # 累计未实现浮盈
     unreal_icon = "🟢" if total_unrealized >= 0 else "🔴"
     lines.append(f"📊 <b>持仓累计浮盈:</b> {unreal_icon} {cur} ${total_unrealized:+,.2f}")
 
